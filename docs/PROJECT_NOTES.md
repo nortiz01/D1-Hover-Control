@@ -1,5 +1,7 @@
 # Project Notes
 
+This file supplements the setup and operating guidance in the root `README.md` with protocol-level details useful during development and debugging.
+
 ## Command Formats
 
 Full arm angle command:
@@ -26,6 +28,8 @@ Zero arm command:
 - HTTP `8080`: browser UI.
 - UDP `8888`: Python/web app to C++ Unitree DDS bridge.
 
+The TCP frame stream is length-prefixed and carries a pickled Python dictionary containing a JPEG buffer and metadata. It is intended only for communication between trusted hosts on an isolated robot network. The UDP bridge forwards received JSON to the D1 DDS command topic without authentication or encryption.
+
 ## AprilTag Pose
 
 The stream script sends:
@@ -35,3 +39,5 @@ The stream script sends:
 - `center_px` and `corners_px`: image-space tag location.
 
 The web app uses tag local +Y as the green axis for wrist alignment.
+
+All translation values use metres. Pixel coordinates use the active RealSense color-stream resolution, and `tag_pose_R_cam` is a 3-by-3 rotation matrix.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(marm_code)
+project(d1_sdk)
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(unitree_sdk2 REQUIRED)

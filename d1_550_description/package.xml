@@ -1,20 +1,19 @@
 <package format="2">
   <name>d1_550_description</name>
   <version>1.0.0</version>
-  <description>
-    <p>URDF Description package for d1_550_description</p>
-    <p>This package contains configuration data, 3D models and launch files
-for d1_550_description robot</p>
-  </description>
-  <author>TODO</author>
-  <maintainer email="TODO@email.com" />
+  <description>ROS 1 description package for the Unitree D1 550 arm, including its URDF, meshes, joint configuration, and visualization and simulation launch files.</description>
+  <author>Nathan</author>
+  <maintainer email="239856498+nortiz01@users.noreply.github.com">Nathan</maintainer>
   <license>BSD</license>
   <buildtool_depend>catkin</buildtool_depend>
-  <depend>roslaunch</depend>
-  <depend>robot_state_publisher</depend>
-  <depend>rviz</depend>
-  <depend>joint_state_publisher_gui</depend>
-  <depend>gazebo</depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>roslaunch</exec_depend>
+  <exec_depend>rostopic</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf</exec_depend>
   <export>
     <architecture_independent />
   </export>
