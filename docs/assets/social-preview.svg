@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">D1 AprilTag Hover Control</title>
+  <desc id="desc">Technical project card showing perception, inverse kinematics, and robot arm control.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071426"/>
+      <stop offset="0.55" stop-color="#102a43"/>
+      <stop offset="1" stop-color="#0b3b4b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="640" rx="36" fill="url(#bg)"/>
+  <g opacity="0.12" stroke="#7dd3fc" fill="none">
+    <path d="M0 112H1280M0 224H1280M0 336H1280M0 448H1280M0 560H1280"/>
+    <path d="M128 0V640M256 0V640M384 0V640M512 0V640M640 0V640M768 0V640M896 0V640M1024 0V640M1152 0V640"/>
+  </g>
+  <rect x="72" y="70" width="1136" height="500" rx="30" fill="#081a2d" fill-opacity="0.88" stroke="#38bdf8" stroke-opacity="0.28" filter="url(#shadow)"/>
+  <rect x="112" y="112" width="10" height="92" rx="5" fill="url(#accent)"/>
+  <text x="154" y="154" fill="#e0f2fe" font-family="Segoe UI,Arial,sans-serif" font-size="30" font-weight="600" letter-spacing="3">UNITREE GO2 + D1</text>
+  <text x="112" y="252" fill="#ffffff" font-family="Segoe UI,Arial,sans-serif" font-size="62" font-weight="700">AprilTag Hover Control</text>
+  <text x="112" y="306" fill="#bae6fd" font-family="Segoe UI,Arial,sans-serif" font-size="27">RealSense perception · URDF inverse kinematics · DDS arm commands</text>
+  <g transform="translate(112 386)" font-family="Segoe UI,Arial,sans-serif">
+    <rect width="240" height="88" rx="18" fill="#102f4c" stroke="#38bdf8" stroke-opacity="0.55"/>
+    <text x="120" y="38" text-anchor="middle" fill="#7dd3fc" font-size="19" font-weight="700">PERCEPTION</text>
+    <text x="120" y="65" text-anchor="middle" fill="#dbeafe" font-size="17">Camera + AprilTag</text>
+    <path d="M250 44H310" stroke="#2dd4bf" stroke-width="5"/>
+    <path d="m300 34 14 10-14 10" fill="none" stroke="#2dd4bf" stroke-width="5"/>
+    <rect x="324" width="240" height="88" rx="18" fill="#102f4c" stroke="#38bdf8" stroke-opacity="0.55"/>
+    <text x="444" y="38" text-anchor="middle" fill="#7dd3fc" font-size="19" font-weight="700">KINEMATICS</text>
+    <text x="444" y="65" text-anchor="middle" fill="#dbeafe" font-size="17">Transform + IK</text>
+    <path d="M574 44H634" stroke="#2dd4bf" stroke-width="5"/>
+    <path d="m624 34 14 10-14 10" fill="none" stroke="#2dd4bf" stroke-width="5"/>
+    <rect x="648" width="240" height="88" rx="18" fill="#102f4c" stroke="#38bdf8" stroke-opacity="0.55"/>
+    <text x="768" y="38" text-anchor="middle" fill="#7dd3fc" font-size="19" font-weight="700">CONTROL</text>
+    <text x="768" y="65" text-anchor="middle" fill="#dbeafe" font-size="17">UDP + Unitree DDS</text>
+  </g>
+  <text x="112" y="530" fill="#94a3b8" font-family="Segoe UI,Arial,sans-serif" font-size="20">Hardware-in-the-loop robotics project · Python · C++ · Computer vision</text>
+</svg>

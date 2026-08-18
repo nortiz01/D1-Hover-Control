@@ -28,7 +28,13 @@ Zero arm command:
 - HTTP `8080`: browser UI.
 - UDP `8888`: Python/web app to C++ Unitree DDS bridge.
 
-The TCP frame stream is length-prefixed and carries a pickled Python dictionary containing a JPEG buffer and metadata. It is intended only for communication between trusted hosts on an isolated robot network. The UDP bridge forwards received JSON to the D1 DDS command topic without authentication or encryption.
+The TCP frame stream uses the versioned `D1SP` protocol defined in `d1_stream_protocol.py`. Each frame has a fixed 16-byte network-order header followed by strict JSON metadata and raw JPEG bytes. Receivers reject malformed versions, non-finite or duplicate JSON values, metadata over 256 KiB, JPEGs over 16 MiB, and invalid JPEG boundaries. The protocol deliberately never deserializes executable Python objects.
+
+Framing limits protect memory and parsing behavior; they do not authenticate or encrypt the peer. The receiver accepts only source addresses resolved from the configured `go2_host` unless `--stream-allow-any-peer` is explicitly supplied; this blocks accidental or unrelated peers but is not cryptographic authentication. Keep the stream and UDP command bridge on an isolated robot network. The UDP bridge defaults to `127.0.0.1`, rejects oversized or malformed datagrams, and accepts only supported D1 command schemas with finite, range-checked numeric values. Its transport still has no authentication or encryption; use `--bind` to expose another interface only for an intentionally firewalled deployment.
+
+Arm joints use their padded URDF angle bounds. Gripper commands and settings are restricted to `0`–`90` degrees, which contains the shipped `0`/`60` closed/open defaults. A different physical gripper contract requires matching, reviewed changes in the Python and C++ validators.
+
+The HTTP UI defaults to loopback and requires an expected `Host`, a same-origin `Origin`, JSON content, and a per-process request token for state-changing calls. These browser-request protections do not provide user accounts or TLS and are not a reason to expose the control service publicly.
 
 ## AprilTag Pose
 

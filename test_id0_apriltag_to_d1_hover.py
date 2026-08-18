@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from test_d1_550_ik import (
+from d1_kinematics import (
     DEFAULT_TOOL_OFFSET,
     DEFAULT_URDF,
     ORIENTATION_MODES,
