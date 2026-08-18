@@ -103,8 +103,7 @@ void move_and_wait(ChannelPublisher<ArmString_>& publisher, const std::vector<fl
         }
 
         if (stall_count > max_stall) { 
-            // LOGIC CHANGE: If we stopped moving, just ACCEPT the position and move on.
-            // This prevents the 30-degree base offset from ruining the whole sequence.
+            // Continue from the closest reachable position if motion stalls.
             cout << " [Limit Hit - Proceeding]";
             break;
         }

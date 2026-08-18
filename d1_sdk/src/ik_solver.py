@@ -1,10 +1,18 @@
+"""Legacy ikpy-based IK example for the D1 arm.
+
+The primary application uses the self-contained solver in ``test_d1_550_ik.py``.
+This example remains for users who already have ikpy installed.
+"""
+
+import json
+import socket
+from pathlib import Path
+
 import ikpy.chain
 import numpy as np
-import socket
-import json
 
 # --- Configuration ---
-URDF_PATH = "/home/nortiz01/d1_550_description/urdf/d1_550_description.urdf"
+URDF_PATH = Path(__file__).resolve().parents[2] / "d1_550_description" / "urdf" / "d1_550_description.urdf"
 LOCAL_UDP_IP = "127.0.0.1"
 LOCAL_UDP_PORT = 8888
 
@@ -14,7 +22,7 @@ udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # --- 1. Load the D1 Arm URDF ---
 try:
     d1_arm_chain = ikpy.chain.Chain.from_urdf_file(
-        URDF_PATH,
+        str(URDF_PATH),
         active_links_mask=[False] + [True] * 7 
     )
     print(f"[System] Kinematic Chain loaded. Total links: {len(d1_arm_chain.links)}")

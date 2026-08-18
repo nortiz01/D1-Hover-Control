@@ -1,6 +1,4 @@
 <launch>
-  <arg
-    name="model" />
   <param
     name="robot_description"
     textfile="$(find d1_550_description)/urdf/d1_550_description.urdf" />
@@ -15,6 +13,5 @@
   <node
     name="rviz"
     pkg="rviz"
-    type="rviz"
-    args="-d $(find d1_550_description)/urdf.rviz" />
+    type="rviz" />
 </launch>

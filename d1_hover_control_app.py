@@ -108,6 +108,18 @@ def load_settings() -> dict[str, Any]:
 def save_settings(settings: dict[str, Any]) -> None:
     normalize_settings(settings)
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    try:
+        SETTINGS_PATH.chmod(0o600)
+    except OSError:
+        pass
+
+
+def settings_for_client(settings: dict[str, Any]) -> dict[str, Any]:
+    """Return UI settings without exposing the stored SSH password."""
+    public_settings = dict(settings)
+    public_settings["go2_password"] = ""
+    public_settings["go2_password_configured"] = bool(settings.get("go2_password"))
+    return public_settings
 
 
 def normalize_settings(settings: dict[str, Any]) -> None:
@@ -330,7 +342,7 @@ class SharedState:
                     calc = {"error": str(exc)}
 
             return {
-                "settings": settings,
+                "settings": settings_for_client(settings),
                 "stream": {
                     "connected": self.connection_addr is not None and frame_age is not None and frame_age < 5.0,
                     "connection": self.connection_addr,
@@ -1169,7 +1181,7 @@ INDEX_HTML = r"""<!doctype html>
             <legend>Go2 SSH</legend>
             <div class="field"><label>Host</label><input name="go2_host"></div>
             <div class="field"><label>User</label><input name="go2_user"></div>
-            <div class="field"><label>Password</label><input name="go2_password" type="password"></div>
+            <div class="field"><label>Password</label><input name="go2_password" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved password"></div>
             <div class="field"><label>Python</label><input name="go2_python"></div>
             <div class="field"><label>Stream script</label><input name="go2_stream_script"></div>
             <div class="field"><label>Remote log</label><input name="go2_log"></div>
@@ -1346,6 +1358,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/settings":
                 incoming = self.read_json()
+                if incoming.get("go2_password") == "":
+                    incoming.pop("go2_password")
                 with self.state.lock:
                     was_following = parse_bool(self.state.settings.get("follow_enabled", False))
                     self.state.settings.update(incoming)
@@ -1357,7 +1371,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self.state.follow_last_error = None
                         self.state.follow_last_attempt_time = 0.0
                     save_settings(self.state.settings)
-                    settings = dict(self.state.settings)
+                    settings = settings_for_client(self.state.settings)
                 self.send_json({"ok": True, "settings": settings})
                 return
             if self.path == "/api/send_hover":
@@ -1395,7 +1409,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="D1 arm AprilTag hover-control browser app.")
-    parser.add_argument("--http-host", default="0.0.0.0")
+    parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--stream-host", default="0.0.0.0")
     parser.add_argument("--stream-port", type=int, default=9999)

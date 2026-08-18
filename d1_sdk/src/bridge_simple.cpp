@@ -25,8 +25,7 @@ int main() {
         std::string json_payload = std::string(buffer);
         std::cout << "Relaying IK: " << json_payload << std::endl;
 
-        // We wrap the JSON in the exact command the D1 expects
-        // This runs the binary you already have that doesn't segfault on start
+        // Forward the received payload to the local joint-control executable.
         std::string cmd = "./joint_angle_control '" + json_payload + "' &";
         system(cmd.c_str());
     }
