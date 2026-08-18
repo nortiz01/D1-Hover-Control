@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
-import pickle
 import socket
-import struct
 import time
+
+from d1_stream_protocol import send_frame
 
 
 # --- DEFAULT CONFIGURATION ---
@@ -16,6 +16,11 @@ STREAM_WIDTH = 1280
 STREAM_HEIGHT = 720
 STREAM_FPS = 30
 JPEG_QUALITY = 85
+CONNECT_TIMEOUT_SEC = 5.0
+SEND_TIMEOUT_SEC = 5.0
+INITIAL_RECONNECT_DELAY_SEC = 0.5
+MAX_RECONNECT_DELAY_SEC = 10.0
+DETECTION_LOG_INTERVAL_SEC = 1.0
 
 
 def parse_args():
@@ -49,6 +54,13 @@ def camera_info_from_intrinsics(intr, fps):
     }
 
 
+def connect_stream(host: str, port: int) -> socket.socket:
+    """Connect a bounded-time stream socket suitable for reconnect attempts."""
+    connection = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_SEC)
+    connection.settimeout(SEND_TIMEOUT_SEC)
+    return connection
+
+
 def main() -> int:
     args = parse_args()
     width = max(160, int(args.width))
@@ -66,8 +78,11 @@ def main() -> int:
     config = rs.config()
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock: socket.socket | None = None
     pipeline_started = False
+    reconnect_delay = INITIAL_RECONNECT_DELAY_SEC
+    last_detection_log = 0.0
+    last_frame_warning = 0.0
     try:
         profile = pipeline.start(config)
         pipeline_started = True
@@ -90,9 +105,6 @@ def main() -> int:
         )
         dist_coeffs = np.zeros((4, 1))
 
-        # 2. Setup Networking
-        sock.connect((args.host, int(args.port)))
-
         print(
             f"[System] Filtering for ID {args.target_id}. "
             f"Streaming {intr.width}x{intr.height}@{fps} to {args.host}:{args.port}.",
@@ -105,10 +117,27 @@ def main() -> int:
         )
 
         while True:
+            if sock is None:
+                try:
+                    sock = connect_stream(args.host, int(args.port))
+                    print(f"[Network] Connected to {args.host}:{args.port}.", flush=True)
+                except OSError as exc:
+                    print(
+                        f"[Network] Connection failed ({exc}); retrying in "
+                        f"{reconnect_delay:.1f}s.",
+                        flush=True,
+                    )
+                    time.sleep(reconnect_delay)
+                    reconnect_delay = min(MAX_RECONNECT_DELAY_SEC, reconnect_delay * 2.0)
+                    continue
+
             try:
                 frames = pipeline.wait_for_frames()
             except RuntimeError as exc:
-                print(f"[Warn] RealSense frame wait failed: {exc}", flush=True)
+                warning_time = time.monotonic()
+                if warning_time - last_frame_warning >= DETECTION_LOG_INTERVAL_SEC:
+                    print(f"[Warn] RealSense frame wait failed: {exc}", flush=True)
+                    last_frame_warning = warning_time
                 continue
             color_frame = frames.get_color_frame()
             if not color_frame:
@@ -116,7 +145,7 @@ def main() -> int:
 
             img = np.asanyarray(color_frame.get_data())
             metadata = {
-                "protocol": "d1_hover_stream_v4",
+                "protocol": "d1_hover_stream_v5",
                 "timestamp": time.time(),
                 "target_id": int(args.target_id),
                 "tag_found": False,
@@ -148,10 +177,13 @@ def main() -> int:
                     }
                 )
 
-                print(
-                    f"[ID {args.target_id}] raw_cam_xyz_m=({fmt_vec6(raw_pos)})",
-                    flush=True,
-                )
+                log_time = time.monotonic()
+                if log_time - last_detection_log >= DETECTION_LOG_INTERVAL_SEC:
+                    print(
+                        f"[ID {args.target_id}] raw_cam_xyz_m=({fmt_vec6(raw_pos)})",
+                        flush=True,
+                    )
+                    last_detection_log = log_time
 
                 pts = np.array(tag.corners, dtype=np.int32)
                 cv2.polylines(img, [pts], True, (0, 255, 0), 2)
@@ -169,15 +201,25 @@ def main() -> int:
 
             success, buffer = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
             if success:
-                payload = pickle.dumps({"jpeg": buffer, "metadata": metadata})
-                message = struct.pack("Q", len(payload)) + payload
-                sock.sendall(message)
+                try:
+                    send_frame(sock, metadata, buffer)
+                    reconnect_delay = INITIAL_RECONNECT_DELAY_SEC
+                except OSError as exc:
+                    print(
+                        f"[Network] Send failed ({exc}); retrying in {reconnect_delay:.1f}s.",
+                        flush=True,
+                    )
+                    sock.close()
+                    sock = None
+                    time.sleep(reconnect_delay)
+                    reconnect_delay = min(MAX_RECONNECT_DELAY_SEC, reconnect_delay * 2.0)
     except KeyboardInterrupt:
         print("\n[System] Shutting down.", flush=True)
     finally:
         if pipeline_started:
             pipeline.stop()
-        sock.close()
+        if sock is not None:
+            sock.close()
     return 0
 
 

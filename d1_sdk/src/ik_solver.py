@@ -1,6 +1,6 @@
 """Legacy ikpy-based IK example for the D1 arm.
 
-The primary application uses the self-contained solver in ``test_d1_550_ik.py``.
+The primary application uses the self-contained solver in ``d1_kinematics.py``.
 This example remains for users who already have ikpy installed.
 """
 

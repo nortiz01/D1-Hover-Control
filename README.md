@@ -1,10 +1,24 @@
 # D1 AprilTag Hover Control
 
+<p align="center">
+  <img src="docs/assets/social-preview.png" alt="D1 AprilTag Hover Control project overview" width="100%">
+</p>
+
+[![CI](https://github.com/nortiz01/D1-Hover-Control/actions/workflows/ci.yml/badge.svg)](https://github.com/nortiz01/D1-Hover-Control/actions/workflows/ci.yml)
+
 Browser-based control software for a Unitree Go2-mounted D1 arm. The system streams Intel RealSense color frames from the robot, detects a target AprilTag, transforms the tag pose into the D1 arm base frame, solves inverse kinematics (IK), and sends arm commands through a Unitree DDS bridge.
 
 This repository contains the hardware-in-the-loop prototype developed for an MCTR 430 class project. It includes source code and robot-description assets, but not generated builds, local logs, saved credentials, Intel RealSense source, or Unitree SDK2 source.
 
 > **Project status:** experimental robotics prototype. Operation requires the listed hardware, calibration for the physical installation, and active supervision. The project does not implement collision avoidance.
+
+## Engineering Highlights
+
+- Separates on-robot perception from laptop-side visualization, calibration, inverse kinematics, and command coordination.
+- Derives the D1 kinematic chain from the supplied URDF instead of duplicating robot geometry in application code.
+- Uses bounded, versioned frame transport and one ordered outbound command path to avoid stale backlogs and interleaved robot commands.
+- Provides hardware-independent validation for kinematics, protocol framing, configuration, URDF assets, and documentation.
+- Keeps hardware limitations explicit: hosted CI does not claim to validate Unitree SDK2, RealSense, DDS, or physical arm behavior.
 
 ## Features
 
@@ -20,8 +34,10 @@ This repository contains the hardware-in-the-loop prototype developed for an MCT
 
 ```text
 d1_hover_control_app.py          Browser UI, calibration, IK, UDP command sender
+d1_kinematics.py                 Reusable URDF kinematics and IK implementation
+d1_stream_protocol.py            Bounded, versioned frame transport
 test_tags3d_d435i_stream.py      Robot-side RealSense + AprilTag TCP stream producer
-test_d1_550_ik.py                D1 URDF parser and IK solver
+test_d1_550_ik.py                Hardware-free IK command-line smoke test
 send_d1_550_ik_to_arm.py         CLI IK target sender
 test_id0_apriltag_to_d1_hover.py CLI AprilTag-to-hover command tool
 test_tags3d_live.py              Simple OpenCV stream viewer
@@ -31,10 +47,23 @@ requirements-go2.txt             Go2 Python dependencies
 d1_sdk/                          C++ Unitree DDS bridge and helper controls
 d1_550_description/              D1 URDF, meshes, launch files, and config
 docs/PROJECT_NOTES.md            Command payloads, network ports, and pose fields
+docs/ARCHITECTURE.md             Components, trust boundaries, and data flow
+tests/                           Hardware-independent automated test suite
 THIRD_PARTY_NOTICES.md           Provenance and licensing notes for reused sources
 ```
 
 ## System Architecture
+
+The complete component and trust-boundary diagram is available in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+```mermaid
+flowchart LR
+    Camera[RealSense + AprilTag] -->|Framed JPEG and pose| App[Laptop UI + calibration]
+    App --> IK[URDF inverse kinematics]
+    IK --> Queue[Ordered command path]
+    Queue -->|UDP JSON| DDS[Unitree DDS bridge]
+    DDS --> Arm[D1 arm]
+```
 
 1. `test_tags3d_d435i_stream.py` runs on the Unitree Go2.
 2. The Go2 RealSense camera streams 1280x720 color frames and AprilTag pose metadata over TCP to the laptop.
@@ -55,11 +84,12 @@ THIRD_PARTY_NOTICES.md           Provenance and licensing notes for reused sourc
 
 ## Safety and Security
 
-Use this system with the robot supported and with the arm workspace clear. Start with `Dry Run`, verify the target coordinates and IK result, then send small moves. Keep follow mode off until manual hover commands behave as expected. The gripper open/closed angles are configurable because class hardware may differ.
+Use this system with the robot supported and with the arm workspace clear. Start with `Dry Run`, verify the target coordinates and IK result, then send small moves. Keep follow mode off until manual hover commands behave as expected. Gripper commands are restricted to the project's validated `0`–`90` degree software range; the example uses `0` degrees closed and `60` degrees open.
 
-- Run the UI and stream receiver only on an isolated, trusted robot network. The HTTP control API has no authentication, and the frame protocol uses Python `pickle`, which must never process data from an untrusted sender.
-- Keep the HTTP listener on `127.0.0.1` unless another trusted device needs the UI. Binding it to `0.0.0.0` exposes the control API to the local network.
-- The application accepts the Go2 SSH host key on first connection. Confirm that the configured IP belongs to the expected robot before entering credentials.
+- Run the UI and stream receiver only on an isolated, trusted robot network. The HTTP control API and frame stream have no peer authentication or transport encryption. The frame protocol rejects executable object formats and enforces size limits, but an unknown peer must still be treated as untrusted.
+- Keep the HTTP listener on `127.0.0.1` unless another trusted device needs the UI. The UI rejects unexpected hosts and uses a per-process same-origin request token, but it is not a multi-user authentication system. Binding it to `0.0.0.0` exposes the control surface to the local network.
+- The command bridge binds UDP on `127.0.0.1` by default and validates supported D1 command schemas and numeric ranges. Bind it to another interface only for an intentionally firewalled deployment.
+- The application logs and records the first-seen Go2 SSH fingerprint in `~/.config/d1-hover-control/known_hosts`, then refuses later key changes. Verify the configured address before first use and compare that fingerprint through an independent channel when available; trust on first use cannot detect a compromised initial connection. Verify the robot independently before replacing a rejected key.
 - Do not commit `d1_hover_settings.json`; it can contain a plaintext robot SSH password and installation-specific calibration values. The file is ignored by Git and written with owner-only permissions where the operating system supports them.
 
 ## Prerequisites
@@ -104,6 +134,7 @@ Edit `d1_hover_settings.json`:
 - `go2_password`: robot SSH password for your lab setup.
 - `stream_laptop_host`: laptop IP reachable from the Go2.
 - Calibration values: `camera_to_link0_x_m`, `rgb_to_body_arm_y_m`, `camera_to_link0_z_m`, `fixed_camera_pitch_deg`, and `hover_z_m`.
+- Gripper angles must remain between `0` and `90` degrees. Hardware requiring another range needs a reviewed change to both the Python and C++ command validators, not only a UI setting change.
 
 The template contains example network and calibration values, not universal measurements. Recalibrate them for the physical camera and arm installation. Leaving the password blank is supported when only the local tools are used; the UI's remote start/stop controls require valid SSH credentials.
 
@@ -126,13 +157,13 @@ source /home/unitree/apriltag_env_sys/bin/activate
 python -m pip install --upgrade pip
 ```
 
-Copy and install the robot-side requirements, then copy the stream script:
+Copy and install the robot-side requirements, then copy the stream script and its shared protocol module into the same directory:
 
 ```bash
 scp requirements-go2.txt unitree@192.168.123.18:/home/unitree/requirements-go2.txt
 ssh unitree@192.168.123.18 '/home/unitree/apriltag_env_sys/bin/pip install -r /home/unitree/requirements-go2.txt'
 
-scp test_tags3d_d435i_stream.py unitree@192.168.123.18:/home/unitree/test_tags3d_d435i_stream.py
+scp test_tags3d_d435i_stream.py d1_stream_protocol.py unitree@192.168.123.18:/home/unitree/
 ssh unitree@192.168.123.18 'chmod +x /home/unitree/test_tags3d_d435i_stream.py'
 ```
 
@@ -171,6 +202,14 @@ The web app expects this binary:
 d1_sdk/build_project430/multiple_joint_angle_control
 ```
 
+The bridge listens only on loopback by default. To run it independently on a different local port, use:
+
+```bash
+d1_sdk/build_project430/multiple_joint_angle_control --bind 127.0.0.1 --port 8888
+```
+
+Use `--bind 0.0.0.0` only when remote LAN access is deliberately required and restricted by a firewall. The UDP protocol itself is not authenticated or encrypted.
+
 ## Running the Web App
 
 On the laptop:
@@ -179,6 +218,8 @@ On the laptop:
 source .venv/bin/activate
 python d1_hover_control_app.py --http-host 127.0.0.1 --http-port 8080 --stream-host 0.0.0.0 --stream-port 9999
 ```
+
+Although the frame listener must normally bind a reachable interface, it accepts connections only from addresses currently resolved for the configured `go2_host`. If an intentional NAT or tunnel makes the Go2 appear under another source address, `--stream-allow-any-peer` disables this check; use that escape hatch only on an isolated network because a spoofed frame can influence follow-mode motion.
 
 Open:
 
@@ -209,6 +250,8 @@ Recommended first run:
 - `Follow AprilTag`: repeatedly sends hover commands when the tag target moves more than `follow_min_move_m`.
 - `Start Bridge` / `Stop Bridge`: controls the local UDP-to-DDS bridge.
 - `Start Go2 Stream` / `Stop Go2 Stream`: controls the robot-side RealSense stream over SSH.
+
+The browser client automatically supplies the per-process request token required by the control API. Custom API clients must first obtain that token from `/api/state`, then send same-origin requests with `Content-Type: application/json` and the matching `X-CSRF-Token` header.
 
 ## Manual Tools
 
@@ -299,7 +342,7 @@ If `Start Bridge` reports that the executable does not exist, build `d1_sdk/buil
 
 `Start Go2 Stream` fails
 
-Check `go2_host`, `go2_user`, `go2_password`, `go2_python`, and `go2_stream_script` in `d1_hover_settings.json`.
+Check `go2_host`, `go2_user`, `go2_password`, `go2_python`, and `go2_stream_script` in `d1_hover_settings.json`. A first successful SSH connection stores the robot key in `~/.config/d1-hover-control/known_hosts`; a later mismatch is rejected. If the TCP log says the stream peer was rejected, make sure `go2_host` resolves to the source address used by the robot.
 
 IK misses tolerance
 
@@ -309,11 +352,29 @@ Green-axis alignment says `align no pose`
 
 Restart the Go2 stream with the updated `test_tags3d_d435i_stream.py`. Older stream scripts do not send `tag_pose_R_cam`.
 
+## Development Checks
+
+The automated suite exercises stream framing, web-request protections, settings persistence, command serialization, UDP validation, and production URDF kinematics without robot hardware:
+
+```bash
+python -m pip install -r requirements-laptop.txt PyYAML pytest
+python -m compileall -q \
+  d1_hover_control_app.py d1_kinematics.py d1_stream_protocol.py \
+  send_d1_550_ik_to_arm.py test_d1_550_ik.py \
+  test_id0_apriltag_to_d1_hover.py test_tags3d_d435i_stream.py \
+  test_tags3d_live.py d1_sdk/src/ik_solver.py tests tools
+python tools/validation/validate_repository.py
+python -m pytest -q tests
+python test_d1_550_ik.py 0.35 0.00 0.20 --orientation none
+```
+
+On a machine with Unitree SDK2, also build the C++ bridge. Hosted CI compiles and runs the dependency-free command validator, but full DDS linking and physical motion remain hardware-environment checks.
+
 ## Known Limitations
 
 - The system has no obstacle or self-collision checking; IK convergence and joint limits are not a complete motion-safety system.
 - Camera-to-arm calibration is manual and installation-specific.
-- The UI, TCP stream, and UDP bridge are unauthenticated and unencrypted.
+- The HTTP UI has same-origin request protections but no user login or TLS. TCP source-address filtering and UDP loopback binding reduce exposure, but neither protocol is cryptographically authenticated or encrypted.
 - Robot-side behavior and build compatibility depend on the installed Unitree SDK2 and RealSense environment; they cannot be validated without the target hardware.
 
 ## License

@@ -9,27 +9,35 @@ calibration transform, IK solve, UDP send, and browser UI.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import ipaddress
 import json
 import math
 import os
-import pickle
+import re
+import secrets
 import shlex
 import socket
-import struct
 import subprocess
+import tempfile
 import threading
 import time
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
 
-from test_d1_550_ik import (
+from d1_kinematics import (
     DEFAULT_TOOL_OFFSET,
     DEFAULT_URDF,
+    GRIPPER_ANGLE_MAX_DEG,
+    GRIPPER_ANGLE_MIN_DEG,
     ORIENTATION_MODES,
     find_chain,
     load_joints,
@@ -37,11 +45,18 @@ from test_d1_550_ik import (
     solve_ik,
     target_rotation_for_mode,
 )
+from d1_stream_protocol import FrameReader, StreamProtocolError
 
 
 ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = ROOT / "d1_hover_settings.json"
 LOG_DIR = ROOT / "logs"
+SSH_KNOWN_HOSTS_PATH = Path.home() / ".config" / "d1-hover-control" / "known_hosts"
+MAX_HTTP_JSON_BYTES = 64 * 1024
+BRIDGE_STATUS_TTL_SEC = 2.0
+STREAM_SOCKET_TIMEOUT_SEC = 2.0
+STREAM_IDLE_TIMEOUT_SEC = 10.0
+SSH_KNOWN_HOSTS_LOCK = threading.Lock()
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "fixed_camera_pitch_deg": 30.0,
@@ -88,30 +103,260 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
-def now() -> float:
-    return time.time()
+class SettingsValidationError(ValueError):
+    """Raised when persisted or submitted settings are unsafe or malformed."""
 
 
-def load_settings() -> dict[str, Any]:
-    settings = dict(DEFAULT_SETTINGS)
-    if SETTINGS_PATH.exists():
+class RequestSecurityError(ValueError):
+    """Raised when an HTTP request fails a browser security check."""
+
+    def __init__(self, message: str, status: HTTPStatus = HTTPStatus.FORBIDDEN):
+        super().__init__(message)
+        self.status = status
+
+
+def _save_host_keys_atomically(host_keys: Any, path: Path) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+        host_keys.save(str(temporary_path))
+        # Windows requires a writable file descriptor for fsync().
+        with temporary_path.open("rb+") as handle:
+            os.fsync(handle.fileno())
         try:
-            saved = json.loads(SETTINGS_PATH.read_text())
-            if isinstance(saved, dict):
-                settings.update(saved)
-        except Exception:
+            temporary_path.chmod(0o600)
+        except OSError:
             pass
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _ssh_key_sha256_fingerprint(key: Any) -> str:
+    digest = hashlib.sha256(key.asbytes()).digest()
+    encoded = base64.b64encode(digest).decode("ascii").rstrip("=")
+    return f"SHA256:{encoded}"
+
+
+class PersistentTOFUHostKeyPolicy:
+    """Persist the first SSH host key and reject later key changes."""
+
+    def __init__(self, paramiko_module: Any, known_hosts_path: Path):
+        self.paramiko = paramiko_module
+        self.known_hosts_path = known_hosts_path
+
+    def missing_host_key(self, client: Any, hostname: str, key: Any) -> None:
+        with SSH_KNOWN_HOSTS_LOCK:
+            host_keys = self.paramiko.HostKeys()
+            if self.known_hosts_path.exists():
+                host_keys.load(str(self.known_hosts_path))
+
+            known = host_keys.lookup(hostname)
+            key_type = key.get_name()
+            if known:
+                expected = known.get(key_type)
+                if expected is None or expected != key:
+                    expected_key = expected or next(iter(known.values()))
+                    raise self.paramiko.BadHostKeyException(hostname, key, expected_key)
+            else:
+                host_keys.add(hostname, key_type, key)
+                _save_host_keys_atomically(host_keys, self.known_hosts_path)
+                print(
+                    f"[SSH] Trusted first-seen key for {hostname}: "
+                    f"{key_type} {_ssh_key_sha256_fingerprint(key)}; "
+                    f"saved to {self.known_hosts_path}",
+                    flush=True,
+                )
+
+            client.get_host_keys().add(hostname, key_type, key)
+
+
+def _authority(authority: str) -> tuple[str, int]:
+    if not authority or any(character.isspace() for character in authority):
+        raise RequestSecurityError("Missing or invalid Host header")
+    try:
+        parsed = urlsplit(f"http://{authority}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise RequestSecurityError("Missing or invalid Host header") from exc
+    if (
+        hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RequestSecurityError("Missing or invalid Host header")
+    return hostname.lower().rstrip("."), 80 if port is None else port
+
+
+def _is_loopback(hostname: str) -> bool:
+    if hostname.lower().rstrip(".") == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped is not None and mapped.is_loopback)
+
+
+def validate_host_header(
+    host_header: str | None,
+    *,
+    local_host: str,
+    configured_host: str,
+    expected_port: int,
+) -> tuple[str, int]:
+    requested_host, requested_port = _authority(host_header or "")
+    allowed_hosts = {local_host.lower().rstrip(".")}
+    configured = configured_host.lower().rstrip(".")
+    if configured not in {"", "0.0.0.0", "::"}:
+        allowed_hosts.add(configured)
+    if _is_loopback(local_host) or _is_loopback(configured_host):
+        allowed_hosts.update({"localhost", "127.0.0.1", "::1"})
+    if requested_host not in allowed_hosts or requested_port != expected_port:
+        raise RequestSecurityError("Host header does not match this control server")
+    return requested_host, requested_port
+
+
+def validate_post_headers(
+    *,
+    host_header: str | None,
+    origin_header: str | None,
+    content_type: str | None,
+    csrf_header: str | None,
+    csrf_token: str,
+    local_host: str,
+    configured_host: str,
+    expected_port: int,
+) -> None:
+    host = validate_host_header(
+        host_header,
+        local_host=local_host,
+        configured_host=configured_host,
+        expected_port=expected_port,
+    )
+    if content_type != "application/json":
+        raise RequestSecurityError(
+            "POST requests require Content-Type: application/json",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+        )
+    if not csrf_header or not secrets.compare_digest(csrf_header, csrf_token):
+        raise RequestSecurityError("Missing or invalid CSRF token")
+    if not origin_header:
+        raise RequestSecurityError("POST requests require a same-origin Origin header")
+    try:
+        origin = urlsplit(origin_header)
+        origin_port = origin.port
+    except ValueError as exc:
+        raise RequestSecurityError("Invalid Origin header") from exc
+    if (
+        origin.scheme != "http"
+        or origin.hostname is None
+        or origin.username is not None
+        or origin.password is not None
+        or origin.path
+        or origin.query
+        or origin.fragment
+    ):
+        raise RequestSecurityError("Invalid Origin header")
+    normalized_origin = (origin.hostname.lower().rstrip("."), 80 if origin_port is None else origin_port)
+    if normalized_origin != host:
+        raise RequestSecurityError("Origin header does not match Host header")
+
+
+def now() -> float:
+    return time.monotonic()
+
+
+def normalize_ip_address(value: str) -> str:
+    address = ipaddress.ip_address(value.split("%", 1)[0])
+    mapped = getattr(address, "ipv4_mapped", None)
+    return str(mapped if mapped is not None else address)
+
+
+def resolve_stream_peer_addresses(hostname: str) -> set[str]:
+    addresses: set[str] = set()
+    for _family, _socktype, _protocol, _canonical_name, sockaddr in socket.getaddrinfo(
+        hostname,
+        None,
+        family=socket.AF_UNSPEC,
+        type=socket.SOCK_STREAM,
+    ):
+        try:
+            addresses.add(normalize_ip_address(str(sockaddr[0])))
+        except ValueError:
+            continue
+    if not addresses:
+        raise OSError(f"No IP addresses resolved for configured Go2 host {hostname!r}")
+    return addresses
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> dict[str, Any]:
+    settings = dict(DEFAULT_SETTINGS)
+    if path.exists():
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SettingsValidationError(f"Cannot read settings from {path}: {exc}") from exc
+        if not isinstance(saved, dict):
+            raise SettingsValidationError(f"Settings in {path} must be a JSON object")
+        settings.update(saved)
     normalize_settings(settings)
     return settings
 
 
-def save_settings(settings: dict[str, Any]) -> None:
+def save_settings(settings: dict[str, Any], path: Path = SETTINGS_PATH) -> None:
     normalize_settings(settings)
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
     try:
-        SETTINGS_PATH.chmod(0o600)
-    except OSError:
-        pass
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(settings, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            temp_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def settings_for_client(settings: dict[str, Any]) -> dict[str, Any]:
@@ -123,42 +368,123 @@ def settings_for_client(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_settings(settings: dict[str, Any]) -> None:
+    unknown = sorted(set(settings) - set(DEFAULT_SETTINGS))
+    if unknown:
+        raise SettingsValidationError(f"Unknown setting(s): {', '.join(unknown)}")
     for key, default in DEFAULT_SETTINGS.items():
         settings.setdefault(key, default)
     if settings["orientation"] not in ORIENTATION_MODES:
-        settings["orientation"] = "down"
+        raise SettingsValidationError(f"orientation must be one of {ORIENTATION_MODES}")
     if settings["fallback_orientation"] not in ORIENTATION_MODES:
-        settings["fallback_orientation"] = "none"
+        raise SettingsValidationError(f"fallback_orientation must be one of {ORIENTATION_MODES}")
     tool = settings.get("tool_offset_m", DEFAULT_TOOL_OFFSET)
     if not isinstance(tool, list) or len(tool) != 3:
-        settings["tool_offset_m"] = list(DEFAULT_TOOL_OFFSET)
-    for key in ("stream_width", "stream_height", "stream_fps", "stream_jpeg_quality"):
+        raise SettingsValidationError("tool_offset_m must be a list of three finite numbers")
+    settings["tool_offset_m"] = [_finite_float(value, f"tool_offset_m[{index}]", -10.0, 10.0) for index, value in enumerate(tool)]
+
+    integer_bounds = {
+        "stream_width": (160, 8192),
+        "stream_height": (120, 8192),
+        "stream_fps": (1, 240),
+        "stream_jpeg_quality": (1, 100),
+        "ik_max_iter": (1, 10000),
+        "gripper_servo_id": (0, 6),
+        "udp_port": (1, 65535),
+        "udp_repeat": (1, 100),
+    }
+    for key, (minimum, maximum) in integer_bounds.items():
+        if isinstance(settings[key], bool):
+            raise SettingsValidationError(f"{key} must be an integer")
         try:
-            settings[key] = int(settings[key])
+            value = int(settings[key])
         except (TypeError, ValueError):
-            settings[key] = int(DEFAULT_SETTINGS[key])
-    settings["stream_width"] = max(160, settings["stream_width"])
-    settings["stream_height"] = max(120, settings["stream_height"])
-    settings["stream_fps"] = max(1, settings["stream_fps"])
-    settings["stream_jpeg_quality"] = min(100, max(1, settings["stream_jpeg_quality"]))
-    for key in ("follow_min_move_m", "follow_min_interval_sec"):
-        try:
-            settings[key] = max(0.0, float(settings[key]))
-        except (TypeError, ValueError):
-            settings[key] = float(DEFAULT_SETTINGS[key])
+            raise SettingsValidationError(f"{key} must be an integer") from None
+        if isinstance(settings[key], float) and not settings[key].is_integer():
+            raise SettingsValidationError(f"{key} must be an integer")
+        if not minimum <= value <= maximum:
+            raise SettingsValidationError(f"{key} must be between {minimum} and {maximum}")
+        settings[key] = value
+
+    float_bounds: dict[str, tuple[float | None, float | None]] = {
+        "fixed_camera_pitch_deg": (-360.0, 360.0),
+        "camera_to_link0_x_m": (-10.0, 10.0),
+        "rgb_to_body_arm_y_m": (-10.0, 10.0),
+        "camera_to_link0_z_m": (-10.0, 10.0),
+        "hover_z_m": (-2.0, 2.0),
+        "max_target_age_sec": (0.01, 300.0),
+        "orientation_tol_deg": (0.01, 180.0),
+        "orientation_weight": (0.0, 10.0),
+        "ik_tol_m": (1e-6, 1.0),
+        "ik_damping": (1e-6, 10.0),
+        "gripper_angle": (GRIPPER_ANGLE_MIN_DEG, GRIPPER_ANGLE_MAX_DEG),
+        "gripper_open_angle": (GRIPPER_ANGLE_MIN_DEG, GRIPPER_ANGLE_MAX_DEG),
+        "gripper_closed_angle": (GRIPPER_ANGLE_MIN_DEG, GRIPPER_ANGLE_MAX_DEG),
+        "tag_green_align_gripper_angle": (GRIPPER_ANGLE_MIN_DEG, GRIPPER_ANGLE_MAX_DEG),
+        "udp_interval_sec": (0.0, 60.0),
+        "follow_min_move_m": (0.0, 10.0),
+        "follow_min_interval_sec": (0.0, 60.0),
+    }
+    for key, (minimum, maximum) in float_bounds.items():
+        settings[key] = _finite_float(settings[key], key, minimum, maximum)
+
     if settings["tag_green_align_tool_axis"] not in {"tool-y", "tool-z"}:
-        settings["tag_green_align_tool_axis"] = "tool-y"
-    for key in ("gripper_angle", "gripper_open_angle", "gripper_closed_angle", "tag_green_align_gripper_angle"):
-        try:
-            settings[key] = float(settings[key])
-        except (TypeError, ValueError):
-            settings[key] = float(DEFAULT_SETTINGS[key])
+        raise SettingsValidationError("tag_green_align_tool_axis must be 'tool-y' or 'tool-z'")
+
+    for key in ("gripper_state_open", "tag_green_align_enabled", "force_send", "follow_enabled"):
+        settings[key] = _strict_bool(settings[key], key)
+    for key in (
+        "udp_host",
+        "go2_host",
+        "go2_user",
+        "go2_password",
+        "go2_python",
+        "go2_stream_script",
+        "go2_log",
+        "stream_laptop_host",
+    ):
+        if not isinstance(settings[key], str):
+            raise SettingsValidationError(f"{key} must be a string")
+        if "\x00" in settings[key]:
+            raise SettingsValidationError(f"{key} must not contain NUL characters")
+        if len(settings[key]) > 4096:
+            raise SettingsValidationError(f"{key} must not exceed 4096 characters")
+    for key in (
+        "udp_host",
+        "go2_host",
+        "go2_user",
+        "go2_python",
+        "go2_stream_script",
+        "go2_log",
+        "stream_laptop_host",
+    ):
+        if not settings[key].strip():
+            raise SettingsValidationError(f"{key} must not be empty")
+
+
+def _finite_float(value: Any, key: str, minimum: float | None, maximum: float | None) -> float:
+    if isinstance(value, bool):
+        raise SettingsValidationError(f"{key} must be a number")
     try:
-        settings["gripper_servo_id"] = int(settings["gripper_servo_id"])
+        result = float(value)
     except (TypeError, ValueError):
-        settings["gripper_servo_id"] = int(DEFAULT_SETTINGS["gripper_servo_id"])
-    settings["gripper_servo_id"] = min(6, max(0, settings["gripper_servo_id"]))
-    settings["gripper_state_open"] = parse_bool(settings["gripper_state_open"])
+        raise SettingsValidationError(f"{key} must be a number") from None
+    if not math.isfinite(result):
+        raise SettingsValidationError(f"{key} must be finite")
+    if minimum is not None and result < minimum:
+        raise SettingsValidationError(f"{key} must be at least {minimum}")
+    if maximum is not None and result > maximum:
+        raise SettingsValidationError(f"{key} must be at most {maximum}")
+    return result
+
+
+def _strict_bool(value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.lower() in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        return value.lower() in {"1", "true", "yes", "on"}
+    raise SettingsValidationError(f"{key} must be a boolean")
 
 
 def parse_bool(value: Any) -> bool:
@@ -278,22 +604,15 @@ def fmt_vec(vec: np.ndarray | None) -> str:
     return f"x={vec[0]: .3f} y={vec[1]: .3f} z={vec[2]: .3f}"
 
 
-def jpeg_bytes_from_payload_jpeg(jpeg: Any) -> bytes | None:
-    if jpeg is None:
-        return None
-    if isinstance(jpeg, bytes):
-        return jpeg
-    if isinstance(jpeg, bytearray):
-        return bytes(jpeg)
-    if hasattr(jpeg, "tobytes"):
-        return jpeg.tobytes()
-    return None
-
-
 class SharedState:
     def __init__(self, settings: dict[str, Any]):
         self.lock = threading.RLock()
+        self.frame_condition = threading.Condition(self.lock)
+        self.command_lock = threading.Lock()
+        self.bridge_status_lock = threading.Lock()
+        self.csrf_token = secrets.token_urlsafe(32)
         self.settings = settings
+        self.settings_revision = 0
         self.base_jpeg: bytes | None = None
         self.metadata: dict[str, Any] = {}
         self.frame_time = 0.0
@@ -301,9 +620,16 @@ class SharedState:
         self.connection_addr: str | None = None
         self.stream_error: str | None = None
         self.stream_port = 9999
+        self.stream_allow_any_peer = False
+        self.http_host = "127.0.0.1"
         self.http_port = 8080
         self.bridge_process: subprocess.Popen | None = None
         self.bridge_log_handle = None
+        self.bridge_status_cache: dict[str, Any] | None = None
+        self.bridge_status_cache_time = 0.0
+        self.render_cache_key: tuple[int, int] | None = None
+        self.render_cache_jpeg: bytes | None = None
+        self.last_ik_q: np.ndarray | None = None
         self.last_send: dict[str, Any] | None = None
         self.follow_last_target: list[float] | None = None
         self.follow_last_distance_m: float | None = None
@@ -321,10 +647,29 @@ class SharedState:
             self.frame_count += 1
             self.connection_addr = f"{addr[0]}:{addr[1]}"
             self.stream_error = None
+            self.frame_condition.notify_all()
 
     def set_stream_error(self, message: str) -> None:
         with self.lock:
             self.stream_error = message
+
+    def mark_settings_changed(self) -> None:
+        """Invalidate derived UI state after changing settings; caller holds lock."""
+        self.settings_revision += 1
+        self.render_cache_key = None
+        self.render_cache_jpeg = None
+        self.frame_condition.notify_all()
+
+    def current_render_key(self) -> tuple[int, int]:
+        with self.lock:
+            return self.frame_count, self.settings_revision
+
+    def wait_for_render_change(self, previous: tuple[int, int] | None, timeout: float) -> tuple[int, int]:
+        with self.frame_condition:
+            current = (self.frame_count, self.settings_revision)
+            if previous is not None and current == previous:
+                self.frame_condition.wait(timeout=max(0.0, timeout))
+            return self.frame_count, self.settings_revision
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -341,7 +686,8 @@ class SharedState:
                 except Exception as exc:
                     calc = {"error": str(exc)}
 
-            return {
+            snapshot = {
+                "csrf_token": self.csrf_token,
                 "settings": settings_for_client(settings),
                 "stream": {
                     "connected": self.connection_addr is not None and frame_age is not None and frame_age < 5.0,
@@ -351,6 +697,7 @@ class SharedState:
                     "error": self.stream_error,
                     "port": self.stream_port,
                     "camera": metadata.get("camera"),
+                    "peer_policy": "any" if self.stream_allow_any_peer else settings["go2_host"],
                 },
                 "tag": {
                     "found": bool(metadata.get("tag_found")),
@@ -389,52 +736,79 @@ class SharedState:
                     "send_count": self.follow_send_count,
                     "last_error": self.follow_last_error,
                 },
-                "bridge": bridge_status(self),
                 "last_send": self.last_send,
             }
+        snapshot["bridge"] = bridge_status(self)
+        return snapshot
 
 
 def bridge_status(state: SharedState) -> dict[str, Any]:
-    proc = state.bridge_process
+    with state.lock:
+        proc = state.bridge_process
     if proc is not None:
         code = proc.poll()
         if code is None:
             return {"running": True, "source": "app", "pid": proc.pid}
         return {"running": False, "source": "app", "returncode": code}
 
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "multiple_joint_angle_control"],
-            text=True,
-            capture_output=True,
-            timeout=1.0,
-        )
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        if lines:
-            return {"running": True, "source": "external", "detail": lines[0]}
-    except Exception:
-        pass
-    return {"running": False, "source": "none"}
+    with state.bridge_status_lock:
+        with state.lock:
+            if state.bridge_status_cache is not None and now() - state.bridge_status_cache_time < BRIDGE_STATUS_TTL_SEC:
+                return dict(state.bridge_status_cache)
+        try:
+            result = subprocess.run(
+                ["pgrep", "-af", "multiple_joint_angle_control"],
+                text=True,
+                capture_output=True,
+                timeout=1.0,
+            )
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            status = (
+                {"running": True, "source": "external", "detail": lines[0]}
+                if lines
+                else {"running": False, "source": "none"}
+            )
+        except (OSError, subprocess.SubprocessError):
+            status = {"running": False, "source": "none"}
+        with state.lock:
+            state.bridge_status_cache = dict(status)
+            state.bridge_status_cache_time = now()
+        return status
 
 
 class FrameReceiver(threading.Thread):
-    def __init__(self, state: SharedState, host: str, port: int):
+    def __init__(self, state: SharedState, host: str, port: int, allow_any_peer: bool = False):
         super().__init__(daemon=True)
         self.state = state
         self.host = host
         self.port = port
+        self.allow_any_peer = allow_any_peer
+        self.last_rejection_log = 0.0
+        with self.state.lock:
+            self.state.stream_allow_any_peer = allow_any_peer
 
-    @staticmethod
-    def read_exact(conn: socket.socket, size: int) -> bytes | None:
-        chunks: list[bytes] = []
-        total = 0
-        while total < size:
-            chunk = conn.recv(min(65536, size - total))
-            if not chunk:
-                return None
-            chunks.append(chunk)
-            total += len(chunk)
-        return b"".join(chunks)
+    def peer_is_allowed(self, peer_host: str) -> tuple[bool, str]:
+        if self.allow_any_peer:
+            return True, "peer filtering disabled by --stream-allow-any-peer"
+        with self.state.lock:
+            configured_host = str(self.state.settings["go2_host"])
+        try:
+            allowed_addresses = resolve_stream_peer_addresses(configured_host)
+            normalized_peer = normalize_ip_address(peer_host)
+        except (OSError, ValueError) as exc:
+            return False, f"cannot verify configured Go2 host {configured_host!r}: {exc}"
+        if normalized_peer not in allowed_addresses:
+            expected = ", ".join(sorted(allowed_addresses))
+            return False, f"peer {normalized_peer} does not match {configured_host!r} ({expected})"
+        return True, f"peer matches configured Go2 host {configured_host!r}"
+
+    def reject_peer(self, peer_host: str, peer_port: int, reason: str) -> None:
+        message = f"Rejected stream peer {peer_host}:{peer_port}: {reason}"
+        self.state.set_stream_error(message)
+        log_time = now()
+        if log_time - self.last_rejection_log >= 1.0:
+            print(f"[Stream] {message}", flush=True)
+            self.last_rejection_log = log_time
 
     def run(self) -> None:
         try:
@@ -445,31 +819,38 @@ class FrameReceiver(threading.Thread):
                 self.state.stream_port = self.port
                 while True:
                     conn, addr = server.accept()
-                    with conn:
-                        while True:
-                            header = self.read_exact(conn, struct.calcsize("Q"))
-                            if header is None:
-                                break
-                            size = struct.unpack("Q", header)[0]
-                            payload = self.read_exact(conn, size)
-                            if payload is None:
-                                break
-                            try:
-                                obj = pickle.loads(payload)
-                                if isinstance(obj, dict):
-                                    jpeg = jpeg_bytes_from_payload_jpeg(obj.get("jpeg"))
-                                    metadata = obj.get("metadata") or {}
-                                else:
-                                    jpeg = jpeg_bytes_from_payload_jpeg(obj)
-                                    metadata = {
-                                        "protocol": "legacy_jpeg_only",
-                                        "tag_found": False,
-                                        "raw_cam_xyz_m": None,
-                                    }
-                                if jpeg is not None:
-                                    self.state.update_frame(jpeg, metadata, addr)
-                            except Exception as exc:
-                                self.state.set_stream_error(f"Frame decode error: {exc}")
+                    allowed, reason = self.peer_is_allowed(str(addr[0]))
+                    if not allowed:
+                        self.reject_peer(str(addr[0]), int(addr[1]), reason)
+                        conn.close()
+                        continue
+                    try:
+                        with conn:
+                            conn.settimeout(STREAM_SOCKET_TIMEOUT_SEC)
+                            reader = FrameReader(conn)
+                            last_activity = now()
+                            while True:
+                                buffered_before = reader.buffered_bytes
+                                try:
+                                    frame = reader.read_frame()
+                                except socket.timeout:
+                                    if reader.buffered_bytes != buffered_before:
+                                        last_activity = now()
+                                    if now() - last_activity >= STREAM_IDLE_TIMEOUT_SEC:
+                                        self.state.set_stream_error(
+                                            f"Stream connection from {addr[0]}:{addr[1]} timed out"
+                                        )
+                                        break
+                                    continue
+                                except StreamProtocolError as exc:
+                                    self.state.set_stream_error(f"Frame protocol error: {exc}")
+                                    break
+                                if frame is None:
+                                    break
+                                last_activity = now()
+                                self.state.update_frame(frame.jpeg, frame.metadata, addr)
+                    except OSError as exc:
+                        self.state.set_stream_error(f"Stream connection error: {exc}")
         except Exception as exc:
             self.state.set_stream_error(f"Receiver failed on {self.host}:{self.port}: {exc}")
 
@@ -508,6 +889,9 @@ def draw_overlay(frame: np.ndarray, snapshot: dict[str, Any]) -> np.ndarray:
 
 def render_latest_jpeg(state: SharedState) -> bytes:
     with state.lock:
+        cache_key = (state.frame_count, state.settings_revision)
+        if state.render_cache_key == cache_key and state.render_cache_jpeg is not None:
+            return state.render_cache_jpeg
         base = state.base_jpeg
         settings = dict(state.settings)
         metadata = dict(state.metadata)
@@ -552,7 +936,12 @@ def render_latest_jpeg(state: SharedState) -> bytes:
         frame = draw_overlay(frame, snapshot)
 
     ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(settings["stream_jpeg_quality"])])
-    return encoded.tobytes() if ok else b""
+    rendered = encoded.tobytes() if ok else b""
+    with state.lock:
+        if cache_key == (state.frame_count, state.settings_revision):
+            state.render_cache_key = cache_key
+            state.render_cache_jpeg = rendered
+    return rendered
 
 
 def hover_target_from_metadata(metadata: dict[str, Any], settings: dict[str, Any]) -> np.ndarray | None:
@@ -578,10 +967,16 @@ def send_payload_udp(settings: dict[str, Any], payload_text: str) -> dict[str, A
 
 
 def solve_hover_target(state: SharedState, dry_run: bool, source: str = "manual") -> dict[str, Any]:
+    with state.command_lock:
+        return _solve_hover_target(state, dry_run, source)
+
+
+def _solve_hover_target(state: SharedState, dry_run: bool, source: str) -> dict[str, Any]:
     with state.lock:
         settings = dict(state.settings)
         metadata = dict(state.metadata)
         frame_time = state.frame_time
+        initial_q = None if state.last_ik_q is None else state.last_ik_q.copy()
         seq = state.sequence
         if not dry_run:
             state.sequence += 1
@@ -596,8 +991,11 @@ def solve_hover_target(state: SharedState, dry_run: bool, source: str = "manual"
 
     targets = transform_raw_to_targets(np.array(metadata["raw_cam_xyz_m"], dtype=float), settings)
     target = targets["d1_hover_xyz_m"]
-    result = solve_with_fallback(target, settings, metadata)
+    result = solve_with_fallback(target, settings, metadata, initial_q=initial_q)
     used_orientation, q, achieved, achieved_rotation, error, orientation_error, iterations, converged = result
+    if converged:
+        with state.lock:
+            state.last_ik_q = q.copy()
     gripper_angle = effective_gripper_angle(settings)
     payload = make_d1_payload(q, seq, gripper_angle)
     payload_text = json.dumps(payload, separators=(",", ":"))
@@ -636,10 +1034,16 @@ def solve_hover_target(state: SharedState, dry_run: bool, source: str = "manual"
 
 
 def zero_arm(state: SharedState) -> dict[str, Any]:
+    with state.command_lock:
+        return _zero_arm(state)
+
+
+def _zero_arm(state: SharedState) -> dict[str, Any]:
     with state.lock:
         state.settings["follow_enabled"] = False
         normalize_settings(state.settings)
         save_settings(state.settings)
+        state.mark_settings_changed()
         settings = dict(state.settings)
         seq = state.sequence
         state.sequence += 1
@@ -659,10 +1063,16 @@ def zero_arm(state: SharedState) -> dict[str, Any]:
         state.follow_last_target = None
         state.follow_last_distance_m = None
         state.follow_last_error = None
+        state.last_ik_q = None
     return response
 
 
 def set_gripper(state: SharedState, open_gripper: bool | None = None) -> dict[str, Any]:
+    with state.command_lock:
+        return _set_gripper(state, open_gripper)
+
+
+def _set_gripper(state: SharedState, open_gripper: bool | None) -> dict[str, Any]:
     with state.lock:
         normalize_settings(state.settings)
         if open_gripper is None:
@@ -675,6 +1085,7 @@ def set_gripper(state: SharedState, open_gripper: bool | None = None) -> dict[st
         state.settings["gripper_state_open"] = bool(open_gripper)
         state.settings["gripper_angle"] = target_angle
         save_settings(state.settings)
+        state.mark_settings_changed()
         settings = dict(state.settings)
         seq = state.sequence
         state.sequence += 1
@@ -704,11 +1115,22 @@ def set_gripper(state: SharedState, open_gripper: bool | None = None) -> dict[st
     return response
 
 
-def run_ik(target: np.ndarray, orientation: str, settings: dict[str, Any], target_rotation: np.ndarray | None = None):
-    tool_offset = np.array(settings["tool_offset_m"], dtype=float)
+@lru_cache(maxsize=1)
+def default_movable_chain() -> tuple[Any, ...]:
     joints = load_joints(DEFAULT_URDF)
     chain = find_chain(joints, "base_link", "Empty_Link6")
-    movable_chain = [joint for joint in chain if joint.joint_type != "fixed"]
+    return tuple(joint for joint in chain if joint.joint_type != "fixed")
+
+
+def run_ik(
+    target: np.ndarray,
+    orientation: str,
+    settings: dict[str, Any],
+    target_rotation: np.ndarray | None = None,
+    initial_q: np.ndarray | None = None,
+):
+    tool_offset = np.array(settings["tool_offset_m"], dtype=float)
+    movable_chain = default_movable_chain()
     if target_rotation is None:
         target_rotation = target_rotation_for_mode(orientation)
     return solve_ik(
@@ -721,30 +1143,36 @@ def run_ik(target: np.ndarray, orientation: str, settings: dict[str, Any], targe
         target_rotation=target_rotation,
         orientation_tolerance=math.radians(float(settings["orientation_tol_deg"])),
         orientation_weight=float(settings["orientation_weight"]),
+        initial_q=initial_q,
     )
 
 
-def solve_with_fallback(target: np.ndarray, settings: dict[str, Any], metadata: dict[str, Any] | None = None):
+def solve_with_fallback(
+    target: np.ndarray,
+    settings: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+    initial_q: np.ndarray | None = None,
+):
     if parse_bool(settings.get("tag_green_align_enabled", False)):
         target_rotation = target_rotation_for_tag_green(metadata or {}, settings)
         if target_rotation is None:
             raise RuntimeError("Tag green-axis pose is not available yet. Restart the Go2 stream to send pose_R metadata.")
-        primary = run_ik(target, "tag-green", settings, target_rotation=target_rotation)
+        primary = run_ik(target, "tag-green", settings, target_rotation=target_rotation, initial_q=initial_q)
         if primary[-1]:
             return ("tag-green", *primary)
         fallback = str(settings["fallback_orientation"])
         if fallback != "none":
-            secondary = run_ik(target, fallback, settings)
+            secondary = run_ik(target, fallback, settings, initial_q=initial_q)
             if secondary[-1]:
                 return (fallback, *secondary)
         return ("tag-green", *primary)
 
     orientation = str(settings["orientation"])
-    primary = run_ik(target, orientation, settings)
+    primary = run_ik(target, orientation, settings, initial_q=initial_q)
     if primary[-1] or settings["fallback_orientation"] == orientation:
         return (orientation, *primary)
     fallback = str(settings["fallback_orientation"])
-    secondary = run_ik(target, fallback, settings)
+    secondary = run_ik(target, fallback, settings, initial_q=initial_q)
     if secondary[-1]:
         return (fallback, *secondary)
     return (orientation, *primary)
@@ -813,47 +1241,88 @@ class AutoFollower(threading.Thread):
 
 
 def start_bridge(state: SharedState) -> dict[str, Any]:
-    with state.lock:
-        if state.bridge_process is not None and state.bridge_process.poll() is None:
-            return {"ok": True, "message": "Bridge already running", "pid": state.bridge_process.pid}
+    with state.bridge_status_lock:
+        with state.lock:
+            if state.bridge_process is not None and state.bridge_process.poll() is None:
+                return {"ok": True, "message": "Bridge already running", "pid": state.bridge_process.pid}
+            udp_port = int(state.settings["udp_port"])
+            previous_log_handle = state.bridge_log_handle
+            state.bridge_log_handle = None
+
+        if previous_log_handle is not None:
+            try:
+                previous_log_handle.close()
+            except OSError:
+                pass
 
         LOG_DIR.mkdir(exist_ok=True)
         log_path = LOG_DIR / "d1_bridge.log"
-        if state.bridge_log_handle is not None:
-            try:
-                state.bridge_log_handle.close()
-            except Exception:
-                pass
         log_handle = log_path.open("ab")
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = "/usr/local/lib:" + env.get("LD_LIBRARY_PATH", "")
-        cmd = [str(ROOT / "d1_sdk" / "build_project430" / "multiple_joint_angle_control")]
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT / "d1_sdk" / "build_project430"),
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-        state.bridge_process = proc
-        state.bridge_log_handle = log_handle
-        return {"ok": True, "message": "Bridge started", "pid": proc.pid, "log": str(log_path)}
+        cmd = [
+            str(ROOT / "d1_sdk" / "build_project430" / "multiple_joint_angle_control"),
+            "--port",
+            str(udp_port),
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT / "d1_sdk" / "build_project430"),
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception:
+            log_handle.close()
+            raise
+
+        with state.lock:
+            state.bridge_process = proc
+            state.bridge_log_handle = log_handle
+            state.bridge_status_cache = None
+            state.bridge_status_cache_time = 0.0
+        return {
+            "ok": True,
+            "message": "Bridge started",
+            "pid": proc.pid,
+            "port": udp_port,
+            "log": str(log_path),
+        }
 
 
 def stop_bridge(state: SharedState) -> dict[str, Any]:
-    with state.lock:
-        proc = state.bridge_process
+    with state.bridge_status_lock:
+        with state.lock:
+            proc = state.bridge_process
+            log_handle = state.bridge_log_handle
+            state.bridge_process = None
+            state.bridge_log_handle = None
+            state.bridge_status_cache = None
+            state.bridge_status_cache_time = 0.0
+
         if proc is None or proc.poll() is not None:
+            if log_handle is not None:
+                log_handle.close()
             return {"ok": True, "message": "No app-started bridge is running"}
+
         proc.terminate()
         try:
             proc.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=1.0)
+        finally:
+            if log_handle is not None:
+                log_handle.close()
         return {"ok": True, "message": "Bridge stopped"}
 
 
-def run_go2_command(settings: dict[str, Any], command: str) -> str:
+def run_go2_command(
+    settings: dict[str, Any],
+    command: str,
+    known_hosts_path: Path = SSH_KNOWN_HOSTS_PATH,
+) -> str:
     try:
         import warnings
 
@@ -864,18 +1333,38 @@ def run_go2_command(settings: dict[str, Any], command: str) -> str:
         raise RuntimeError(f"paramiko is not available: {exc}") from exc
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(
-            hostname=str(settings["go2_host"]),
-            username=str(settings["go2_user"]),
-            password=str(settings["go2_password"]),
-            timeout=5.0,
-        )
+        client.load_system_host_keys()
+        for system_path in (Path("/etc/ssh/ssh_known_hosts"), Path("/etc/ssh/ssh_known_hosts2")):
+            if system_path.is_file():
+                client.load_system_host_keys(str(system_path))
+        if known_hosts_path.exists():
+            try:
+                client.load_host_keys(str(known_hosts_path))
+            except Exception as exc:
+                raise RuntimeError(f"Cannot load D1 SSH host keys from {known_hosts_path}: {exc}") from exc
+        client.set_missing_host_key_policy(PersistentTOFUHostKeyPolicy(paramiko, known_hosts_path))
+        try:
+            client.connect(
+                hostname=str(settings["go2_host"]),
+                username=str(settings["go2_user"]),
+                password=str(settings["go2_password"]),
+                timeout=5.0,
+            )
+        except paramiko.BadHostKeyException as exc:
+            raise RuntimeError(
+                f"SSH host key for {settings['go2_host']} changed; refusing the connection. "
+                f"Verify the Go2 identity before updating {known_hosts_path}."
+            ) from exc
         _stdin, stdout, stderr = client.exec_command(command)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
-        return (out + err).strip()
+        result = (out + err).strip()
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            detail = f": {result}" if result else ""
+            raise RuntimeError(f"Go2 command exited with status {exit_status}{detail}")
+        return result
     finally:
         client.close()
 
@@ -884,8 +1373,12 @@ def start_remote_stream(state: SharedState) -> dict[str, Any]:
     with state.lock:
         settings = dict(state.settings)
         stream_port = state.stream_port
-    script_name = Path(str(settings["go2_stream_script"])).name
-    pkill_pattern = shlex.quote(f"[{script_name[0]}]{script_name[1:]}")
+    script_path = PurePosixPath(str(settings["go2_stream_script"]))
+    script_name = script_path.name
+    if not script_name:
+        raise SettingsValidationError("go2_stream_script must include a filename")
+    protocol_path = script_path.with_name("d1_stream_protocol.py")
+    pkill_pattern = shlex.quote(re.escape(str(script_path)))
     log = shlex.quote(str(settings["go2_log"]))
     stream_cmd = [
         str(settings["go2_python"]),
@@ -905,7 +1398,15 @@ def start_remote_stream(state: SharedState) -> dict[str, Any]:
         str(settings["stream_jpeg_quality"]),
     ]
     command_text = " ".join(shlex.quote(part) for part in stream_cmd)
-    stop_output = run_go2_command(settings, f"pkill -f {pkill_pattern} || true")
+    preflight = " && ".join(
+        (
+            f"test -x {shlex.quote(str(settings['go2_python']))}",
+            f"test -r {shlex.quote(str(script_path))}",
+            f"test -r {shlex.quote(str(protocol_path))}",
+        )
+    )
+    run_go2_command(settings, preflight)
+    stop_output = run_go2_command(settings, f"pkill -f -- {pkill_pattern} || true")
     start_output = run_go2_command(settings, f"nohup {command_text} > {log} 2>&1 < /dev/null & echo $!")
     return {
         "ok": True,
@@ -921,9 +1422,12 @@ def start_remote_stream(state: SharedState) -> dict[str, Any]:
 def stop_remote_stream(state: SharedState) -> dict[str, Any]:
     with state.lock:
         settings = dict(state.settings)
-    script_name = Path(str(settings["go2_stream_script"])).name
-    pkill_pattern = shlex.quote(f"[{script_name[0]}]{script_name[1:]}")
-    output = run_go2_command(settings, f"pkill -f {pkill_pattern} || true")
+    script_path = PurePosixPath(str(settings["go2_stream_script"]))
+    script_name = script_path.name
+    if not script_name:
+        raise SettingsValidationError("go2_stream_script must include a filename")
+    pkill_pattern = shlex.quote(re.escape(str(script_path)))
+    output = run_go2_command(settings, f"pkill -f -- {pkill_pattern} || true")
     return {"ok": True, "message": "Go2 stream stop requested", "output": output}
 
 
@@ -932,6 +1436,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="d1-csrf-token" content="__D1_CSRF_TOKEN__">
   <title>D1 Hover Control</title>
   <style>
     :root {
@@ -1207,6 +1712,7 @@ INDEX_HTML = r"""<!doctype html>
       "stream_width","stream_height","stream_fps","stream_jpeg_quality"
     ]);
     let settingsLoaded = false;
+    let csrfToken = document.querySelector('meta[name="d1-csrf-token"]').content;
 
     function fmt(v) {
       if (!v) return "--";
@@ -1230,6 +1736,7 @@ INDEX_HTML = r"""<!doctype html>
     async function refresh() {
       const res = await fetch("/api/state");
       const state = await res.json();
+      if (state.csrf_token) csrfToken = state.csrf_token;
       if (!settingsLoaded) fillSettings(state.settings);
       const stream = state.stream;
       const camera = stream.camera;
@@ -1273,13 +1780,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     document.getElementById("settingsForm").addEventListener("submit", async (event) => {
       event.preventDefault();
-      const res = await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(collectSettings())});
+      const res = await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json","X-CSRF-Token":csrfToken}, body:JSON.stringify(collectSettings())});
       document.getElementById("resultBox").textContent = JSON.stringify(await res.json(), null, 2);
       settingsLoaded = false;
       refresh();
     });
     async function post(path, body={}) {
-      const res = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      const res = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json","X-CSRF-Token":csrfToken}, body:JSON.stringify(body)});
       const data = await res.json();
       document.getElementById("resultBox").textContent = JSON.stringify(data, null, 2);
       refresh();
@@ -1307,25 +1814,70 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def local_host(self) -> str:
+        try:
+            return str(self.connection.getsockname()[0])
+        except (AttributeError, OSError, TypeError):
+            return str(self.server.server_address[0])
+
+    def validate_request_host(self) -> tuple[str, int]:
+        return validate_host_header(
+            self.headers.get("Host"),
+            local_host=self.local_host(),
+            configured_host=self.state.http_host,
+            expected_port=self.state.http_port,
+        )
+
+    def validate_post_request(self) -> None:
+        validate_post_headers(
+            host_header=self.headers.get("Host"),
+            origin_header=self.headers.get("Origin"),
+            content_type=self.headers.get("Content-Type"),
+            csrf_header=self.headers.get("X-CSRF-Token"),
+            csrf_token=self.state.csrf_token,
+            local_host=self.local_host(),
+            configured_host=self.state.http_host,
+            expected_port=self.state.http_port,
+        )
+
     def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise SettingsValidationError("Content-Length must be an integer") from None
+        if length < 0 or length > MAX_HTTP_JSON_BYTES:
+            raise SettingsValidationError(f"JSON request body must not exceed {MAX_HTTP_JSON_BYTES} bytes")
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise SettingsValidationError("JSON request body must be an object")
+        return payload
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        try:
+            self.validate_request_host()
+        except RequestSecurityError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, int(exc.status))
+            return
         if self.path == "/" or self.path.startswith("/?"):
-            body = INDEX_HTML.encode("utf-8")
+            body = INDEX_HTML.replace("__D1_CSRF_TOKEN__", self.state.csrf_token).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1341,14 +1893,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.end_headers()
             try:
+                last_key: tuple[int, int] | None = None
+                next_send_time = now()
                 while True:
+                    current_key = self.state.wait_for_render_change(last_key, timeout=1.0)
+                    if last_key is not None and current_key == last_key:
+                        continue
+                    with self.state.lock:
+                        fps = int(self.state.settings["stream_fps"])
+                    remaining = next_send_time - now()
+                    if remaining > 0.0:
+                        time.sleep(remaining)
                     frame = render_latest_jpeg(self.state)
+                    with self.state.lock:
+                        rendered_key = (
+                            self.state.render_cache_key
+                            if self.state.render_cache_jpeg is frame
+                            else current_key
+                        )
                     self.wfile.write(b"--frame\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
                     self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
-                    time.sleep(0.08)
+                    last_key = rendered_key
+                    next_send_time = now() + 1.0 / max(1, fps)
             except (BrokenPipeError, ConnectionResetError):
                 return
             return
@@ -1356,21 +1925,26 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            self.validate_post_request()
             if self.path == "/api/settings":
                 incoming = self.read_json()
                 if incoming.get("go2_password") == "":
                     incoming.pop("go2_password")
                 with self.state.lock:
                     was_following = parse_bool(self.state.settings.get("follow_enabled", False))
-                    self.state.settings.update(incoming)
-                    normalize_settings(self.state.settings)
-                    is_following = parse_bool(self.state.settings.get("follow_enabled", False))
+                    candidate = dict(self.state.settings)
+                    candidate.update(incoming)
+                    normalize_settings(candidate)
+                    save_settings(candidate)
+                    self.state.settings.clear()
+                    self.state.settings.update(candidate)
+                    self.state.mark_settings_changed()
+                    is_following = parse_bool(candidate.get("follow_enabled", False))
                     if is_following and not was_following:
                         self.state.follow_last_target = None
                         self.state.follow_last_distance_m = None
                         self.state.follow_last_error = None
                         self.state.follow_last_attempt_time = 0.0
-                    save_settings(self.state.settings)
                     settings = settings_for_client(self.state.settings)
                 self.send_json({"ok": True, "settings": settings})
                 return
@@ -1403,25 +1977,50 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json(stop_remote_stream(self.state))
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
+        except RequestSecurityError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, int(exc.status))
+        except SettingsValidationError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, 400)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.send_json({"ok": False, "error": f"Invalid JSON: {exc}"}, 400)
         except Exception as exc:
             self.send_json({"ok": False, "error": str(exc)}, 500)
 
 
-def main() -> int:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="D1 arm AprilTag hover-control browser app.")
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--stream-host", default="0.0.0.0")
     parser.add_argument("--stream-port", type=int, default=9999)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--stream-allow-any-peer",
+        action="store_true",
+        help=(
+            "Disable source-address filtering for a trusted NAT/tunnel deployment. "
+            "By default only addresses resolved from the configured Go2 host are "
+            "accepted; this opt-out lets any reachable peer submit frames."
+        ),
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_argument_parser().parse_args()
 
     settings = load_settings()
     save_settings(settings)
     state = SharedState(settings)
+    state.http_host = args.http_host
     state.http_port = args.http_port
     state.stream_port = args.stream_port
 
-    receiver = FrameReceiver(state, args.stream_host, args.stream_port)
+    receiver = FrameReceiver(
+        state,
+        args.stream_host,
+        args.stream_port,
+        allow_any_peer=args.stream_allow_any_peer,
+    )
     receiver.start()
     follower = AutoFollower(state)
     follower.start()
@@ -1430,6 +2029,13 @@ def main() -> int:
     server = ThreadingHTTPServer((args.http_host, args.http_port), RequestHandler)
     print(f"[UI] Open http://127.0.0.1:{args.http_port}")
     print(f"[Stream] Listening for Go2 frames on {args.stream_host}:{args.stream_port}")
+    if args.stream_allow_any_peer:
+        print(
+            "[Stream] Warning: peer filtering is disabled by --stream-allow-any-peer; "
+            "any reachable peer may submit frames"
+        )
+    else:
+        print(f"[Stream] Accepting frames only from configured Go2 host {settings['go2_host']}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
